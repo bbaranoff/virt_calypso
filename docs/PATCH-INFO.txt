@@ -1,0 +1,42 @@
+From: Calypso Developer <dev@example.com>
+Date: Thu, 6 Feb 2025 12:00:00 +0000
+Subject: [PATCH] hw/arm: Add Calypso SoC minimal machine
+
+Add support for the Calypso SoC (TI ARM946-based) minimal machine.
+This SoC was used in various old mobile phones.
+
+Features:
+- ARM946E-S CPU
+- 256 KiB RAM (configurable)
+- 4 MiB NOR Flash (CFI01)
+- UART with basic I/O
+- SPI controller stub
+- Timer
+- Multiple MMIO peripheral blocks
+
+The machine supports loading ELF firmware and automatically patches
+the flash pointer for compatibility with existing firmware images.
+
+Signed-off-by: Calypso Developer <dev@example.com>
+---
+ hw/arm/Kconfig          |    1 +
+ hw/arm/meson.build      |    1 +
+ hw/arm/calypso/Kconfig       |    5 +
+ hw/arm/calypso/meson.build   |    5 +
+ hw/arm/calypso/calypso.c     | 1000+ lines
+ 5 files changed, 1000+ insertions(+)
+ create mode 100644 hw/arm/calypso/Kconfig
+ create mode 100644 hw/arm/calypso/meson.build
+ create mode 100644 hw/arm/calypso/calypso.c
+
+Instructions pour appliquer ce patch:
+
+1. Sauvegarder ce fichier comme "0001-add-calypso-support.patch"
+
+2. Depuis le répertoire racine de QEMU:
+   git am 0001-add-calypso-support.patch
+
+Ou manuellement:
+   patch -p1 < 0001-add-calypso-support.patch
+
+Puis copier les fichiers calypso.c, Kconfig et meson.build dans hw/arm/calypso/

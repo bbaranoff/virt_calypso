@@ -1,0 +1,7 @@
+config CALYPSO
+    bool
+    default y
+    depends on TCG && ARM
+    select PFLASH_CFI01
+    select SERIAL
+    select UNIMP
