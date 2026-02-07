@@ -28,6 +28,8 @@
 #include "qemu/timer.h"
 #include "hw/irq.h"
 
+#include "calypso_trx.h"
+
 /* ========================================================================
  * Memory Map
  * ======================================================================== */
@@ -70,12 +72,16 @@
  * IRQ definitions (matches Calypso INTH)
  * ======================================================================== */
 
-#define CALYPSO_IRQ_TIMER1    3
-#define CALYPSO_IRQ_TIMER2    4
-#define CALYPSO_IRQ_KEYPAD    5
-#define CALYPSO_IRQ_SPI       7
-#define CALYPSO_IRQ_UART_MODEM 9
-#define CALYPSO_IRQ_UART_IRDA  2
+/* IRQ numbers — must match OsmocomBB calypso/irq.h */
+#define CALYPSO_IRQ_TIMER1       1
+#define CALYPSO_IRQ_TIMER2       2
+#define CALYPSO_IRQ_TPU_FRAME    4
+#define CALYPSO_IRQ_TPU_PAGE     5
+#define CALYPSO_IRQ_UART_MODEM   7
+#define CALYPSO_IRQ_KEYPAD       8
+#define CALYPSO_IRQ_SPI         13
+#define CALYPSO_IRQ_API         15
+#define CALYPSO_IRQ_UART_IRDA   18
 #define CALYPSO_NUM_IRQS      32
 
 /* ========================================================================
@@ -721,9 +727,7 @@ static void calypso_high_init(MachineState *machine)
     calypso_create_mmio(sysmem, "calypso.mmio_18xx",
                         CALYPSO_MMIO_18XX, &calypso_mmio8_ops, NULL,
                         CALYPSO_PERIPH_SIZE);
-    calypso_create_mmio(sysmem, "calypso.mmio_28xx",
-                        CALYPSO_MMIO_28XX, &calypso_mmio8_ops, NULL,
-                        CALYPSO_PERIPH_SIZE);
+    /* NOTE: 0xFFFE2800 (ULPD) is handled by calypso_trx.c */
     calypso_create_mmio(sysmem, "calypso.mmio_80xx",
                         CALYPSO_MMIO_80XX, &calypso_mmio8_ops, NULL,
                         CALYPSO_PERIPH_SIZE);
@@ -748,6 +752,9 @@ static void calypso_high_init(MachineState *machine)
     calypso_create_mmio(sysmem, "calypso.mmio_ffxx",
                         CALYPSO_MMIO_FFXX, &calypso_mmio8_ops, NULL,
                         CALYPSO_PERIPH_SIZE);
+
+    /* ---- TRX bridge (DSP API, TPU, TSP, ULPD, TDMA timer, TRX UDP) ---- */
+    calypso_trx_init(sysmem, s->irqs, 4729);
 
     /* Load firmware (bare-metal ELF, not Linux) */
     if (machine->kernel_filename) {

@@ -24,8 +24,10 @@ mkdir -p "$CALYPSO_DIR"
 
 # Copy source files
 echo "[1/6] Copying source files ..."
+cp "$SCRIPT_DIR/hw/arm/calypso/calypso_trx.h" "$CALYPSO_DIR/"
 cp "$SCRIPT_DIR/hw/arm/calypso/calypso.c" "$CALYPSO_DIR/"
 cp "$SCRIPT_DIR/hw/arm/calypso/calypso_high.c" "$CALYPSO_DIR/"
+cp "$SCRIPT_DIR/hw/arm/calypso/calypso_trx.c" "$CALYPSO_DIR/"
 echo "       Copied calypso.c and calypso_high.c"
 
 # Install meson.build (ALWAYS overwrite — old version was broken)
