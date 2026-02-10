@@ -1,6 +1,7 @@
 /*
  * Calypso SoC "high" machine for OsmocomBB highram firmware
  * QEMU 9.2 — includes INTH, timers w/ IRQ, keypad, TWL3025 ABB stub
+ * PATCHED: Full UART RX/TX support with CharBackend
  *
  * Usage:
  *   qemu-system-arm -M calypso-high -cpu arm946 \
@@ -518,34 +519,420 @@ static const MemoryRegionOps calypso_spi_ops = {
 };
 
 /* ========================================================================
- * UART with proper status bits
+ * UART with full RX/TX support via CharBackend
+ * PATCH v3: 64-byte RX FIFO, DLAB routing, level-sensitive IRQ,
+ *           full TI Calypso UART register set (incl. SSR, ACREG, FIFO levels)
  * ======================================================================== */
+
+#define UART_FIFO_SIZE  64  /* Calypso hardware FIFO depth */
+
+typedef struct CalypsoUART {
+    MemoryRegion iomem;
+    CharBackend chr;
+    qemu_irq irq;
+
+    /* Identification */
+    const char *name;  /* "modem" or "irda" */
+
+    /* RX FIFO */
+    uint8_t rx_fifo[UART_FIFO_SIZE];
+    int     rx_head;   /* next write position */
+    int     rx_tail;   /* next read  position */
+    int     rx_count;  /* bytes in FIFO       */
+
+    /* UART registers */
+    uint8_t ier;       /* Interrupt Enable Register          */
+    uint8_t lcr;       /* Line Control Register              */
+    uint8_t mcr;       /* Modem Control Register             */
+    uint8_t msr;       /* Modem Status Register              */
+    uint8_t scr;       /* Scratch Pad Register (SPR)         */
+    uint8_t mdr1;      /* Mode Definition Register 1         */
+    uint8_t dll;       /* Divisor Latch Low                  */
+    uint8_t dlh;       /* Divisor Latch High                 */
+    uint8_t efr;       /* Enhanced Feature Register          */
+    uint8_t tlr;       /* Trigger Level Register             */
+    uint8_t fcr;       /* FIFO Control (write-only, shadow)  */
+    uint8_t xon1;      /* XON1 register                      */
+    uint8_t xon2;      /* XON2 register                      */
+    uint8_t xoff1;     /* XOFF1 register                     */
+    uint8_t xoff2;     /* XOFF2 register                     */
+
+    /* IRQ state tracking */
+    bool    irq_raised;
+} CalypsoUART;
+
+/* LSR bits */
+#define UART_LSR_DR   0x01  /* Data Ready           */
+#define UART_LSR_OE   0x02  /* Overrun Error        */
+#define UART_LSR_THRE 0x20  /* THR Empty            */
+#define UART_LSR_TEMT 0x40  /* Transmitter Empty    */
+
+/* IER bits */
+#define UART_IER_RDI  0x01  /* RX Data Available    */
+#define UART_IER_THRI 0x02  /* THR Empty            */
+#define UART_IER_RLSI 0x04  /* RX Line Status       */
+#define UART_IER_MSI  0x08  /* Modem Status         */
+
+/* IIR values */
+#define UART_IIR_NO_INT    0x01  /* No interrupt pending      */
+#define UART_IIR_RDI       0x04  /* RX Data Available         */
+#define UART_IIR_THRI      0x02  /* THR Empty                 */
+#define UART_IIR_FIFO_EN   0xC0  /* FIFOs enabled             */
+
+/* LCR bits */
+#define UART_LCR_DLAB     0x80  /* Divisor Latch Access Bit  */
+#define UART_LCR_ENHANCED 0xBF  /* Magic value for EFR access */
+
+/* ---- FIFO helpers ---- */
+
+static inline bool uart_rx_empty(CalypsoUART *s)
+{
+    return s->rx_count == 0;
+}
+
+static inline bool uart_rx_full(CalypsoUART *s)
+{
+    return s->rx_count >= UART_FIFO_SIZE;
+}
+
+static void uart_rx_push(CalypsoUART *s, uint8_t byte)
+{
+    if (uart_rx_full(s)) {
+        fprintf(stderr, "[calypso-uart-%s] RX FIFO OVERRUN (dropped 0x%02x)\n",
+                s->name, byte);
+        return;
+    }
+    s->rx_fifo[s->rx_head] = byte;
+    s->rx_head = (s->rx_head + 1) % UART_FIFO_SIZE;
+    s->rx_count++;
+}
+
+static uint8_t uart_rx_pop(CalypsoUART *s)
+{
+    uint8_t byte;
+    if (uart_rx_empty(s)) {
+        return 0x00;
+    }
+    byte = s->rx_fifo[s->rx_tail];
+    s->rx_tail = (s->rx_tail + 1) % UART_FIFO_SIZE;
+    s->rx_count--;
+    return byte;
+}
+
+static void uart_rx_reset(CalypsoUART *s)
+{
+    s->rx_head = 0;
+    s->rx_tail = 0;
+    s->rx_count = 0;
+}
+
+/* ---- IRQ management (level-sensitive) ---- */
+
+static void calypso_uart_update_irq(CalypsoUART *s)
+{
+    bool should_raise = false;
+
+    /* RX data available interrupt */
+    if ((s->ier & UART_IER_RDI) && !uart_rx_empty(s)) {
+        should_raise = true;
+    }
+    /* THR empty interrupt (TX always ready in our implementation) */
+    if (s->ier & UART_IER_THRI) {
+        should_raise = true;
+    }
+
+    if (should_raise && !s->irq_raised) {
+        qemu_irq_raise(s->irq);
+        s->irq_raised = true;
+    } else if (!should_raise && s->irq_raised) {
+        qemu_irq_lower(s->irq);
+        s->irq_raised = false;
+    }
+}
+
+/* ---- CharBackend callbacks ---- */
+
+static void calypso_uart_rx_callback(void *opaque, const uint8_t *buf, int size)
+{
+    CalypsoUART *s = (CalypsoUART *)opaque;
+
+    fprintf(stderr, "[calypso-uart-%s] RX CALLBACK: size=%d, first_byte=0x%02x, "
+            "fifo_count=%d\n", s->name, size, size > 0 ? buf[0] : 0, s->rx_count);
+
+    for (int i = 0; i < size; i++) {
+        if (!uart_rx_full(s)) {
+            uart_rx_push(s, buf[i]);
+            fprintf(stderr, "[calypso-uart-%s] RX STORED: 0x%02x [fifo %d/%d]\n",
+                    s->name, buf[i], s->rx_count, UART_FIFO_SIZE);
+        } else {
+            fprintf(stderr, "[calypso-uart-%s] RX DROPPED: FIFO full "
+                    "(0x%02x lost)\n", s->name, buf[i]);
+        }
+    }
+
+    calypso_uart_update_irq(s);
+}
+
+static int calypso_uart_can_receive(void *opaque)
+{
+    CalypsoUART *s = (CalypsoUART *)opaque;
+    int avail = UART_FIFO_SIZE - s->rx_count;
+    return avail > 0 ? avail : 0;
+}
+
+static void calypso_uart_event(void *opaque, QEMUChrEvent event)
+{
+    /* Nothing needed for now */
+}
+
+/* ---- Register access ----
+ *
+ * Calypso UART register map (byte offsets, 8-bit access):
+ *
+ *   Offset  DLAB=0/Read   DLAB=0/Write   DLAB=1/R   DLAB=1/W   LCR=0xBF
+ *   0x00    RHR           THR            DLL        DLL        DLL
+ *   0x01    IER           IER            DLH        DLH        IER (special)
+ *   0x02    IIR           FCR            IIR        FCR        EFR
+ *   0x03    LCR           LCR            LCR        LCR        LCR
+ *   0x04    MCR           MCR            MCR        MCR        XON1
+ *   0x05    LSR           -              LSR        -          XON2
+ *   0x06    MSR           MSR            MSR        MSR        XOFF1
+ *   0x07    SPR           SPR            SPR        SPR        XOFF2
+ *   0x08    MDR1          MDR1           -          -          -
+ *   0x10    SCR/SSR       SCR/SSR        -          -          -
+ *   0x80    DLL alias     DLL alias
+ *   0x81    DLH alias     DLH alias
+ */
 
 static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
 {
+    CalypsoUART *s = (CalypsoUART *)opaque;
+    uint64_t ret = 0;
+    bool dlab = (s->lcr & UART_LCR_DLAB);
+    bool enhanced = (s->lcr == UART_LCR_ENHANCED);  /* LCR=0xBF → EFR mode */
+
     switch (offset) {
-    case 0x00: return 0x00;  /* RHR — no data */
-    case 0x04: /* LSR: TX empty + TX holding empty + no errors */
-        return 0x60;
-    case 0x05:
-        return 0xFF;
-    case 0x08: /* MSR */
-        return 0xB0; /* CTS + DSR */
-    case 0x10: /* SSR */
-        return 0x01; /* TX FIFO not full */
+    case 0x00:  /* RHR / DLL */
+        if (dlab || enhanced) {
+            ret = s->dll;
+        } else {
+            ret = uart_rx_pop(s);
+            calypso_uart_update_irq(s);
+            /* Kick chardev to deliver more if available */
+            qemu_chr_fe_accept_input(&s->chr);
+        }
+        break;
+
+    case 0x01:  /* IER / DLH */
+        if (dlab && !enhanced) {
+            ret = s->dlh;
+        } else {
+            ret = s->ier;
+        }
+        break;
+
+    case 0x02:  /* IIR / EFR */
+        if (enhanced) {
+            ret = s->efr;
+        } else {
+            /* Compute IIR dynamically */
+            if ((s->ier & UART_IER_RDI) && !uart_rx_empty(s)) {
+                ret = UART_IIR_RDI | UART_IIR_FIFO_EN;
+            } else if (s->ier & UART_IER_THRI) {
+                ret = UART_IIR_THRI | UART_IIR_FIFO_EN;
+            } else {
+                ret = UART_IIR_NO_INT | UART_IIR_FIFO_EN;
+            }
+        }
+        break;
+
+    case 0x03:  /* LCR */
+        ret = s->lcr;
+        break;
+
+    case 0x04:  /* MCR / XON1 */
+        ret = enhanced ? s->xon1 : s->mcr;
+        break;
+
+    case 0x05:  /* LSR / XON2 */
+        if (enhanced) {
+            ret = s->xon2;
+        } else {
+            ret = UART_LSR_THRE | UART_LSR_TEMT;
+            if (!uart_rx_empty(s)) {
+                ret |= UART_LSR_DR;
+            }
+        }
+        break;
+
+    case 0x06:  /* MSR / XOFF1 */
+        ret = enhanced ? s->xoff1 : s->msr;
+        break;
+
+    case 0x07:  /* SPR / XOFF2 */
+        ret = enhanced ? s->xoff2 : s->scr;
+        break;
+
+    case 0x08:  /* MDR1 */
+        ret = s->mdr1;
+        break;
+
+    case 0x10:  /* SCR / SSR - Supplementary Control Register */
+        ret = 0x00;
+        break;
+
+    case 0x11:  /* SSR - Supplementary Status Register */
+        /* Bit 0: TX_FIFO_FULL (0 = not full, TX always ready) */
+        /* Bit 1: RX_CTS_DSR_WAKE_UP_STS */
+        ret = 0x00;
+        break;
+
+    case 0x12:  /* ACREG - Auxiliary Control Register */
+        ret = 0x00;
+        break;
+
+    case 0x18:  /* TXFLL - TX FIFO Level Low */
+        ret = 0x00;  /* TX FIFO always empty (instant transmit) */
+        break;
+
+    case 0x19:  /* TXFLH - TX FIFO Level High */
+        ret = 0x00;
+        break;
+
+    case 0x1A:  /* RXFLL - RX FIFO Level Low */
+        ret = s->rx_count & 0xFF;
+        break;
+
+    case 0x1B:  /* RXFLH - RX FIFO Level High */
+        ret = 0x00;  /* FIFO never > 64 */
+        break;
+
+    case 0x80:  /* DLL alias (Calypso-specific) */
+        ret = s->dll;
+        break;
+
+    case 0x81:  /* DLH alias (Calypso-specific) */
+        ret = s->dlh;
+        break;
+
     default:
-        return 0;
+        ret = 0;
+        break;
     }
+
+    fprintf(stderr, "[calypso-uart-%s] READ  0x%02x → 0x%02x%s\n",
+            s->name, (unsigned)offset, (uint8_t)ret,
+            (offset == 0x00 && !dlab && !enhanced) ?
+                (uart_rx_empty(s) ? " (FIFO now empty)" : " (FIFO has more)") : "");
+
+    return ret;
 }
 
 static void calypso_uart_write(void *opaque, hwaddr offset, uint64_t value,
                                unsigned size)
 {
-    if (offset == 0x00) {
-        char c = (char)(value & 0xFF);
-        printf("[calypso-uart] '%c' (0x%02x)\n",
-               (c >= 32 && c < 127) ? c : '.', (unsigned)value);
-        fflush(stdout);
+    CalypsoUART *s = (CalypsoUART *)opaque;
+    uint8_t val = value & 0xFF;
+    bool dlab = (s->lcr & UART_LCR_DLAB);
+    bool enhanced = (s->lcr == UART_LCR_ENHANCED);
+
+    fprintf(stderr, "[calypso-uart-%s] WRITE 0x%02x ← 0x%02x\n",
+            s->name, (unsigned)offset, val);
+
+    switch (offset) {
+    case 0x00:  /* THR / DLL */
+        if (dlab || enhanced) {
+            s->dll = val;
+        } else {
+            /* Transmit */
+            qemu_chr_fe_write_all(&s->chr, &val, 1);
+            fprintf(stderr, "[calypso-uart-%s] TX: '%c' (0x%02x)\n",
+                    s->name, (val >= 0x20 && val < 0x7F) ? val : '.', val);
+        }
+        break;
+
+    case 0x01:  /* IER / DLH */
+        if (dlab && !enhanced) {
+            s->dlh = val;
+        } else {
+            s->ier = val & 0x0F;
+            calypso_uart_update_irq(s);
+        }
+        break;
+
+    case 0x02:  /* FCR / EFR */
+        if (enhanced) {
+            s->efr = val;
+        } else {
+            s->fcr = val;
+            /* Bit 1: reset RX FIFO */
+            if (val & 0x02) {
+                uart_rx_reset(s);
+                calypso_uart_update_irq(s);
+            }
+            /* Bit 2: reset TX FIFO (no-op, we transmit immediately) */
+        }
+        break;
+
+    case 0x03:  /* LCR */
+        s->lcr = val;
+        break;
+
+    case 0x04:  /* MCR / XON1 */
+        if (enhanced) {
+            s->xon1 = val;
+        } else {
+            s->mcr = val;
+        }
+        break;
+
+    case 0x05:  /* XON2 (only in enhanced mode, LSR is read-only) */
+        if (enhanced) {
+            s->xon2 = val;
+        }
+        break;
+
+    case 0x06:  /* XOFF1 (enhanced) / MSR write (ignored normally) */
+        if (enhanced) {
+            s->xoff1 = val;
+        }
+        break;
+
+    case 0x07:  /* SPR / XOFF2 */
+        if (enhanced) {
+            s->xoff2 = val;
+        } else {
+            s->scr = val;
+        }
+        break;
+
+    case 0x08:  /* MDR1 */
+        s->mdr1 = val;
+        break;
+
+    case 0x10:  /* SCR - Supplementary Control Register */
+        /* Ignored */
+        break;
+
+    case 0x11:  /* SSR - read-only, ignore writes */
+        break;
+
+    case 0x12:  /* ACREG - Auxiliary Control Register */
+        /* Ignored */
+        break;
+
+    case 0x80:  /* DLL alias (Calypso-specific) */
+        s->dll = val;
+        break;
+
+    case 0x81:  /* DLH alias (Calypso-specific) */
+        s->dlh = val;
+        break;
+
+    default:
+        fprintf(stderr, "[calypso-uart-%s]   ← UNHANDLED offset 0x%02x\n",
+                s->name, (unsigned)offset);
+        break;
     }
 }
 
@@ -553,6 +940,7 @@ static const MemoryRegionOps calypso_uart_ops = {
     .read = calypso_uart_read,
     .write = calypso_uart_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 /* ========================================================================
@@ -613,6 +1001,8 @@ typedef struct CalypsoHighState {
     CalypsoTimer  timer2;
     CalypsoKeypad keypad;
     CalypsoSPI    spi;
+    CalypsoUART   uart_modem;  /* PATCH: Added UART with CharBackend */
+    CalypsoUART   uart_irda;   /* PATCH: Added UART with CharBackend */
 
     /* IRQ inputs to INTH */
     qemu_irq *irqs;
@@ -715,13 +1105,48 @@ static void calypso_high_init(MachineState *machine)
                           "calypso.spi", CALYPSO_PERIPH_SIZE);
     memory_region_add_subregion(sysmem, CALYPSO_SPI_BASE, &s->spi.iomem);
 
-    /* ---- UARTs ---- */
-    calypso_create_mmio(sysmem, "calypso.uart_modem",
-                        CALYPSO_UART_MODEM, &calypso_uart_ops, NULL,
-                        CALYPSO_PERIPH_SIZE);
-    calypso_create_mmio(sysmem, "calypso.uart_irda",
-                        CALYPSO_UART_IRDA, &calypso_uart_ops, NULL,
-                        CALYPSO_PERIPH_SIZE);
+    /* ========================================================================
+     * PATCH: UART MODEM with full CharBackend support
+     * ======================================================================== */
+    
+    /* ---- UART MODEM (pas utilisé par ce loader) ---- */
+    s->uart_modem.name = "modem";
+    s->uart_modem.irq = s->irqs[CALYPSO_IRQ_UART_MODEM];
+    uart_rx_reset(&s->uart_modem);
+    
+    memory_region_init_io(&s->uart_modem.iomem, NULL, &calypso_uart_ops,
+                          &s->uart_modem, "calypso.uart_modem",
+                          CALYPSO_PERIPH_SIZE);
+    memory_region_add_subregion(sysmem, CALYPSO_UART_MODEM,
+                                &s->uart_modem.iomem);
+    
+    /* PAS DE CHARDEV pour modem - ce loader utilise IRDA ! */
+    
+    /* ---- UART IRDA (console / osmocon) ---- */
+    s->uart_irda.name = "irda";
+    s->uart_irda.irq = s->irqs[CALYPSO_IRQ_UART_IRDA];
+    uart_rx_reset(&s->uart_irda);
+    
+    memory_region_init_io(&s->uart_irda.iomem, NULL, &calypso_uart_ops,
+                          &s->uart_irda, "calypso.uart_irda",
+                          CALYPSO_PERIPH_SIZE);
+    memory_region_add_subregion(sysmem, CALYPSO_UART_IRDA,
+                                &s->uart_irda.iomem);
+    
+    /* CRITICAL FIX: Connecter le chardev (serial0) à UART_IRDA !! */
+    /* Le loader utilise IRDA pour osmocon, pas MODEM ! */
+    qemu_chr_fe_init(&s->uart_irda.chr, serial_hd(0), &error_fatal);
+    qemu_chr_fe_set_handlers(&s->uart_irda.chr,
+                             calypso_uart_can_receive,
+                             calypso_uart_rx_callback,
+                             calypso_uart_event,
+                             NULL,
+                             &s->uart_irda,
+                             NULL, true);
+    
+    /* No auto-ping: let the firmware and osmocon handle the handshake
+     * naturally. The FIFO + level-sensitive IRQ ensure data from osmocon
+     * reaches the firmware at the right time. */
 
     /* ---- MMIO stubs ---- */
     calypso_create_mmio(sysmem, "calypso.mmio_18xx",
@@ -780,7 +1205,7 @@ static void calypso_high_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "Calypso SoC (highram) with INTH, timers, keypad, ABB";
+    mc->desc = "Calypso SoC (highram) with INTH, timers, keypad, ABB, UART RX";
     mc->init = calypso_high_init;
     mc->max_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm946");
