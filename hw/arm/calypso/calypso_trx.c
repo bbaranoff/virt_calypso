@@ -6,7 +6,7 @@
  *
  * Architecture:
  *
- *   OsmocomBB L1 firmware (in QEMU)
+ *   OsmocomBB TRX firmware (in QEMU)
  *       │ writes TX bursts to DSP API RAM
  *       │ programs TPU scenario
  *       │ enables TPU
@@ -17,6 +17,13 @@
  *       │ receives RX bursts from TRX UDP
  *       │ injects into API RAM → fires IRQ_API
  *       │ TDMA timer fires IRQ_TPU_FRAME every 4.615 ms
+ *       │
+ *       │ ★ NEW: ARFCN sync simulation ★
+ *       │ Monitors DSP tasks (FB/SB) and simulates:
+ *       │   - FCCH detection (frequency burst found)
+ *       │   - SCH decode (sync burst with BSIC + FN)
+ *       │   - Power measurements
+ *       │   - TDMA lock to virtual reference cell
  *       ▼
  *   TRX UDP endpoint (osmo-bts-trx / virtual radio)
  *
@@ -46,12 +53,17 @@
 #define TRX_LOG(fmt, ...) \
     fprintf(stderr, "[calypso-trx] " fmt "\n", ##__VA_ARGS__)
 
-/* Set to 1 for verbose DSP/TPU register access logging */
+/*
+ * Set to 1 for verbose per-access logging.
+ * TRX_DEBUG_DSP is the most useful for tuning NDB offsets —
+ * it prints every DSP RAM read/write with byte offset and value.
+ */
 #define TRX_DEBUG_DSP    0
 #define TRX_DEBUG_TPU    0
 #define TRX_DEBUG_TSP    0
 #define TRX_DEBUG_ULPD   0
 #define TRX_DEBUG_TDMA   0
+#define TRX_DEBUG_SYNC   1   /* FCCH/SCH sync logging (recommended on) */
 
 /* =====================================================================
  * TRX state
@@ -92,7 +104,7 @@ typedef struct CalypsoTRX {
     /* ----- TRX UDP socket ----- */
     int          trx_fd;          /* Data socket fd (-1 if disabled) */
     int          trx_port;
-    struct sockaddr_in trx_remote;  /* Remote endpoint to send TX bursts */
+    struct sockaddr_in trx_remote;
     bool         trx_connected;
 
     /* ----- Burst buffer ----- */
@@ -102,12 +114,33 @@ typedef struct CalypsoTRX {
     uint8_t      rx_tn;
     int8_t       rx_rssi;
     int16_t      rx_toa;
+
+    /* ----- ARFCN Sync state machine ----- */
+    SyncState    sync_state;
+    uint32_t     sync_fb_countdown;   /* Frames until FB detection */
+    uint32_t     sync_sb_countdown;   /* Frames until SB decode */
+    uint16_t     sync_arfcn;          /* Reference ARFCN */
+    uint8_t      sync_bsic;           /* Fake BSIC */
+    int8_t       sync_rssi;           /* Fake RSSI (dBm) */
+    uint32_t     sync_ref_fn;         /* Reference FN at lock time */
+    uint32_t     sync_task_count;     /* Total tasks seen */
+    uint32_t     sync_fb_tasks;       /* FB tasks counted */
+    uint32_t     sync_sb_tasks;       /* SB tasks counted */
+    bool         sync_dsp_booted;     /* DSP boot sequence complete */
+    uint32_t     sync_boot_frame;     /* Frame when boot status polled */
 } CalypsoTRX;
 
 static CalypsoTRX *g_trx;  /* Global for timer callbacks */
 
+/* Forward declarations */
+static void calypso_dsp_done(void *opaque);
+static void calypso_sync_tick(CalypsoTRX *s);
+
 /* =====================================================================
  * DSP API RAM — shared memory between ARM and (virtual) DSP
+ *
+ * All OsmocomBB firmware variants access DSP through this 64KB window.
+ * We intercept reads/writes to simulate DSP behavior.
  * ===================================================================== */
 
 static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
@@ -126,6 +159,26 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
               ((uint32_t)s->dsp_ram[offset / 2 + 1] << 16);
     } else {
         val = ((uint8_t *)s->dsp_ram)[offset];
+    }
+
+    /*
+     * DSP boot status polling detection:
+     * The firmware polls word 0 (byte 0x0000) waiting for 0x0001 then 0x0002.
+     * If we see repeated reads of offset 0, progress the boot state.
+     */
+    if (offset == DSP_DL_STATUS_ADDR && !s->sync_dsp_booted) {
+        s->sync_boot_frame++;
+        if (s->sync_boot_frame > 3 &&
+            s->dsp_ram[DSP_DL_STATUS_ADDR / 2] == DSP_DL_STATUS_BOOT) {
+            /* Firmware has polled enough — transition to READY */
+            s->dsp_ram[DSP_DL_STATUS_ADDR / 2] = DSP_DL_STATUS_READY;
+            s->dsp_ram[DSP_API_VER_ADDR / 2]   = DSP_API_VERSION;
+            s->dsp_ram[DSP_API_VER2_ADDR / 2]  = 0x0000;
+            s->sync_dsp_booted = true;
+            TRX_LOG("DSP boot: status → 0x0002 (READY), version=0x%04x",
+                    DSP_API_VERSION);
+            val = DSP_DL_STATUS_READY;
+        }
     }
 
 #if TRX_DEBUG_DSP
@@ -161,6 +214,16 @@ static void calypso_dsp_write(void *opaque, hwaddr offset,
     /* Track DSP page changes in NDB area */
     if (offset == DSP_API_NDB + NDB_W_D_DSP_PAGE * 2) {
         s->dsp_page = value & 1;
+    }
+
+    /*
+     * Detect DSP boot sequence writes:
+     * Firmware writes to PARAM area or specific NDB fields during DSP init.
+     * When it writes to the download trigger location, advance boot status.
+     */
+    if (offset == DSP_DL_STATUS_ADDR && value == DSP_DL_STATUS_BOOT) {
+        /* Firmware acknowledging boot — we'll transition to READY on next read */
+        s->sync_boot_frame = 0;
     }
 }
 
@@ -225,7 +288,6 @@ static void trx_receive_cb(void *opaque)
 
     /* Parse RX burst (downlink to phone) */
     s->rx_tn   = buf[0];
-    /* FN from packet (ignore for now, use our own FN) */
     s->rx_rssi = (int8_t)buf[5];
     s->rx_toa  = (int16_t)((buf[6] << 8) | buf[7]);
 
@@ -266,7 +328,7 @@ static void trx_socket_init(CalypsoTRX *s, int port)
         return;
     }
 
-    /* Default remote: localhost:port+100 (configurable later) */
+    /* Default remote: localhost:port+100 */
     memset(&s->trx_remote, 0, sizeof(s->trx_remote));
     s->trx_remote.sin_family = AF_INET;
     s->trx_remote.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -277,17 +339,249 @@ static void trx_socket_init(CalypsoTRX *s, int port)
 }
 
 /* =====================================================================
- * DSP task processing — extract/inject bursts
+ * ARFCN sync simulation — FCCH / SCH state machine
+ *
+ * This is the core addition for making TRX firmware sync work.
+ *
+ * Flow on real hardware:
+ *   1) Firmware sends L1CTL_FBSB_REQ → tunes to ARFCN
+ *   2) L1 programs DSP for FB task (d_task_d = FB code)
+ *   3) DSP searches for FCCH over up to 12 frames
+ *   4) If found: d_fb_det=1, a_cd[TOA,PM,ANGLE,SNR] filled
+ *   5) L1 programs DSP for SB task (d_task_d = SB code)
+ *   6) DSP decodes SCH: a_sch26[5] filled with BSIC+FN
+ *   7) Firmware achieves TDMA lock
+ *
+ * We simulate this by watching d_task_d writes and injecting
+ * results into the NDB after appropriate delays.
+ * ===================================================================== */
+
+/*
+ * Inject FB detection result into NDB.
+ * Called when sync_state transitions to FCCH_FOUND.
+ */
+static void sync_inject_fb_result(CalypsoTRX *s)
+{
+    uint16_t *ndb = &s->dsp_ram[DSP_API_NDB / 2];
+
+    /* d_fb_det = 1 → firmware sees "frequency burst found" */
+    ndb[NDB_W_D_FB_DET] = 1;
+
+    /* a_cd[]: carrier demod results */
+    ndb[NDB_W_A_CD_TOA]   = 384;     /* TOA in quarter-bits (typical) */
+    ndb[NDB_W_A_CD_PM]    = (uint16_t)((s->sync_rssi + 110) * 64);
+                                       /* PM in 1/64 dBm, biased */
+    ndb[NDB_W_A_CD_ANGLE] = 500;     /* Small freq offset (Hz) */
+    ndb[NDB_W_A_CD_SNR]   = 2048;    /* ~2 dB SNR in fx6.10 */
+
+#if TRX_DEBUG_SYNC
+    TRX_LOG("SYNC: FB detected! TOA=%d PM=%d ANGLE=%d SNR=%d (FN=%u)",
+            ndb[NDB_W_A_CD_TOA], ndb[NDB_W_A_CD_PM],
+            ndb[NDB_W_A_CD_ANGLE], ndb[NDB_W_A_CD_SNR], s->fn);
+#endif
+}
+
+/*
+ * Inject SCH decode result into NDB.
+ * Called when sync_state transitions to LOCKED.
+ */
+static void sync_inject_sb_result(CalypsoTRX *s)
+{
+    uint16_t *ndb = &s->dsp_ram[DSP_API_NDB / 2];
+
+    /* Save reference FN at the moment of lock */
+    s->sync_ref_fn = s->fn;
+
+    /* Encode SCH data: BSIC + frame number → a_sch26[5] */
+    uint16_t sch26[5];
+    sch_encode(sch26, s->sync_bsic, s->fn);
+
+    for (int i = 0; i < NDB_W_A_SCH26_LEN; i++) {
+        ndb[NDB_W_A_SCH26 + i] = sch26[i];
+    }
+
+    /* Update a_cd with SB-specific results */
+    ndb[NDB_W_A_CD_TOA]   = 27;       /* Fine TOA (quarter-bits) */
+    ndb[NDB_W_A_CD_PM]    = (uint16_t)((s->sync_rssi + 110) * 64);
+    ndb[NDB_W_A_CD_ANGLE] = 431;      /* Residual freq offset */
+    ndb[NDB_W_A_CD_SNR]   = 4096;     /* Better SNR for SB */
+
+    /* Decode for debug logging */
+    uint32_t t1  = s->fn / (26 * 51);
+    uint32_t t2  = s->fn % 26;
+    uint32_t t3  = s->fn % 51;
+
+#if TRX_DEBUG_SYNC
+    TRX_LOG("SYNC: SCH decoded! BSIC=%d(NCC=%d,BCC=%d) FN=%u "
+            "T1=%u T2=%u T3=%u",
+            s->sync_bsic, (s->sync_bsic >> 3) & 7, s->sync_bsic & 7,
+            s->fn, t1, t2, t3);
+    TRX_LOG("SYNC: a_sch26 = [0x%04x 0x%04x 0x%04x 0x%04x 0x%04x]",
+            sch26[0], sch26[1], sch26[2], sch26[3], sch26[4]);
+#endif
+}
+
+/*
+ * calypso_sync_tick() — called every TDMA frame to advance sync state.
+ *
+ * The state machine monitors DSP tasks written by the firmware
+ * and injects appropriate results after configured delays.
+ */
+static void calypso_sync_tick(CalypsoTRX *s)
+{
+    uint16_t *ndb = &s->dsp_ram[DSP_API_NDB / 2];
+
+    switch (s->sync_state) {
+
+    case SYNC_IDLE:
+        /*
+         * Check if firmware is requesting FB search.
+         * We detect this by looking for non-zero d_task_d in the
+         * active write page.  The firmware writes the task code
+         * and then enables TPU.
+         */
+        break;
+
+    case SYNC_FCCH_SEARCH:
+        /* Count down frames until we "detect" the FCCH */
+        if (s->sync_fb_countdown > 0) {
+            s->sync_fb_countdown--;
+#if TRX_DEBUG_SYNC
+            if (s->sync_fb_countdown == 0) {
+                TRX_LOG("SYNC: FCCH countdown reached zero → injecting FB");
+            }
+#endif
+        }
+        if (s->sync_fb_countdown == 0) {
+            /* Inject FB detection result */
+            sync_inject_fb_result(s);
+            s->sync_state = SYNC_FCCH_FOUND;
+            TRX_LOG("SYNC: state → FCCH_FOUND (FN=%u)", s->fn);
+        }
+        break;
+
+    case SYNC_FCCH_FOUND:
+        /*
+         * FB was detected.  Firmware should now read d_fb_det,
+         * then program an SB task to decode the SCH.
+         * We wait for the SB task to appear.
+         */
+        break;
+
+    case SYNC_SCH_SEARCH:
+        /* Count down frames until we "decode" the SCH */
+        if (s->sync_sb_countdown > 0) {
+            s->sync_sb_countdown--;
+        }
+        if (s->sync_sb_countdown == 0) {
+            /* Inject SCH decode result */
+            sync_inject_sb_result(s);
+            s->sync_state = SYNC_LOCKED;
+            TRX_LOG("SYNC: ★ TDMA LOCKED ★ ARFCN=%d BSIC=%d FN=%u",
+                    s->sync_arfcn, s->sync_bsic, s->fn);
+        }
+        break;
+
+    case SYNC_LOCKED:
+        /*
+         * Maintain lock: update FN in NDB, provide PM results.
+         * The firmware reads d_fn to track time.
+         */
+        ndb[NDB_W_D_FN] = (uint16_t)(s->fn & 0xFFFF);
+        break;
+    }
+}
+
+/*
+ * Detect DSP task type from d_task_d value.
+ *
+ * The Calypso DSP task encoding varies, but the OsmocomBB firmware
+ * uses these identifiers (from tdma_sched.h):
+ *
+ *   Task code | Type
+ *   ----------+------------------
+ *   0         | No task
+ *   1-3       | TCH (traffic)
+ *   4         | FB (frequency burst) ← FCCH detection
+ *   5         | SB (sync burst) ← SCH decode
+ *   6-7       | TCH_FB, TCH_SB (dedicated)
+ *   8         | RACH
+ *   9         | EXT
+ *   10        | NB (normal burst)
+ *   11        | ALLC
+ *   12-14     | FB26, SB26, NB26
+ *   15        | DDL
+ *
+ * The d_task_d word in the DB write page typically contains the
+ * task code in the lower bits, plus tsc/flags in upper bits.
+ * We check bits [3:0] for the basic task type.
+ *
+ * NOTE: The actual numeric values depend on the firmware build.
+ * If sync doesn't work, enable TRX_DEBUG_DSP and check what values
+ * your firmware writes to d_task_d.
+ */
+
+typedef enum {
+    TASK_NONE = 0,
+    TASK_FB,        /* Frequency burst (FCCH) search */
+    TASK_SB,        /* Sync burst (SCH) decode */
+    TASK_NB,        /* Normal burst */
+    TASK_RACH,      /* Random access */
+    TASK_OTHER,     /* Anything else */
+} TaskType;
+
+static TaskType detect_task_type(uint16_t task_d)
+{
+    if (task_d == 0) return TASK_NONE;
+
+    /*
+     * Heuristic detection based on known OsmocomBB task codes.
+     *
+     * The standard mapping uses the task ID as an index.
+     * But the actual d_task_d value written to DSP may encode it
+     * differently.  We try several common patterns:
+     *
+     * Pattern 1: Direct task ID in lower nibble
+     *   FB=4, SB=5, NB=10
+     *
+     * Pattern 2: Bit-field encoding
+     *   d_task_d = (tsc << 5) | (bcch_freq << 3) | task_code
+     *   where task_code: FB=1, SB=2, NB=5, etc.
+     *
+     * Pattern 3: The "d_task_d" field actually contains the
+     *   DSP task command directly (0x000D for FB, 0x001C for SB, etc.)
+     *
+     * We check all patterns and also look at the raw value.
+     */
+
+    uint8_t lo_nib = task_d & 0x0F;
+    uint8_t lo3    = task_d & 0x07;
+
+    /* Pattern 1: Standard task IDs */
+    if (lo_nib == 4 || lo_nib == 12)  return TASK_FB;  /* FB_TASK or FB26_TASK */
+    if (lo_nib == 5 || lo_nib == 13)  return TASK_SB;  /* SB_TASK or SB26_TASK */
+    if (lo_nib == 10 || lo_nib == 14) return TASK_NB;  /* NB_TASK or NB26_TASK */
+    if (lo_nib == 8)                  return TASK_RACH;
+
+    /* Pattern 2: Lower 3-bit encoding */
+    if (lo3 == 1 && task_d < 0x20) return TASK_FB;
+    if (lo3 == 2 && task_d < 0x20) return TASK_SB;
+
+    /* Pattern 3: Known DSP command values */
+    if (task_d == 0x000D) return TASK_FB;
+    if (task_d == 0x000E) return TASK_FB;  /* FB1 (confirm) */
+    if (task_d == 0x001C) return TASK_SB;
+
+    /* Default: non-zero = some active task */
+    return TASK_OTHER;
+}
+
+/* =====================================================================
+ * DSP task processing — extract/inject bursts + sync handling
  * ===================================================================== */
 
 static void calypso_dsp_process(CalypsoTRX *s)
 {
-    /*
-     * Called when TPU is enabled (firmware triggered DSP).
-     * Extract TX burst from write page, send via TRX.
-     * Inject RX burst into read page if available.
-     */
-
     uint16_t *w_page, *r_page, *ndb;
     uint16_t task_d, task_u;
 
@@ -302,22 +596,89 @@ static void calypso_dsp_process(CalypsoTRX *s)
     ndb = &s->dsp_ram[DSP_API_NDB / 2];
 
     /* Read task words from write page header */
-    task_d = w_page[0];  /* d_task_d */
-    task_u = w_page[2];  /* d_task_u */
+    task_d = w_page[DB_W_D_TASK_D];
+    task_u = w_page[DB_W_D_TASK_U];
+
+    if (task_d != 0 || task_u != 0) {
+        s->sync_task_count++;
+    }
+
+    /* ---- Classify the DL task for sync handling ---- */
+    TaskType ttype = detect_task_type(task_d);
+
+    switch (ttype) {
+    case TASK_FB:
+        s->sync_fb_tasks++;
+#if TRX_DEBUG_SYNC
+        TRX_LOG("SYNC: FB task detected (d_task_d=0x%04x, count=%u, "
+                "state=%d, FN=%u)",
+                task_d, s->sync_fb_tasks, s->sync_state, s->fn);
+#endif
+        if (s->sync_state == SYNC_IDLE ||
+            s->sync_state == SYNC_FCCH_SEARCH) {
+            if (s->sync_state == SYNC_IDLE) {
+                /* First FB task — start FCCH search */
+                s->sync_fb_countdown = SYNC_FB_DETECT_DELAY;
+                s->sync_state = SYNC_FCCH_SEARCH;
+                TRX_LOG("SYNC: state → FCCH_SEARCH "
+                        "(will detect in %d frames)",
+                        SYNC_FB_DETECT_DELAY);
+            }
+            /* else: already searching, countdown handled in sync_tick */
+        }
+        break;
+
+    case TASK_SB:
+        s->sync_sb_tasks++;
+#if TRX_DEBUG_SYNC
+        TRX_LOG("SYNC: SB task detected (d_task_d=0x%04x, count=%u, "
+                "state=%d, FN=%u)",
+                task_d, s->sync_sb_tasks, s->sync_state, s->fn);
+#endif
+        if (s->sync_state == SYNC_FCCH_FOUND) {
+            /* FB was found, now searching for SB */
+            s->sync_sb_countdown = SYNC_SB_DECODE_DELAY;
+            s->sync_state = SYNC_SCH_SEARCH;
+            TRX_LOG("SYNC: state → SCH_SEARCH "
+                    "(will decode in %d frames)",
+                    SYNC_SB_DECODE_DELAY);
+        }
+        break;
+
+    case TASK_NB:
+        /* Normal burst — handle TX/RX when locked */
+        if (s->sync_state == SYNC_LOCKED) {
+            /* RX: inject burst from TRX UDP or silence */
+            if (s->rx_pending) {
+                uint16_t *burst_r = &r_page[0x19];
+                for (int i = 0; i < GSM_BURST_BITS; i++) {
+                    burst_r[i] = s->rx_burst[i];
+                }
+                r_page[0] = 1;   /* d_bursttype: normal */
+                r_page[1] = 0;   /* d_result: OK */
+                s->rx_pending = false;
+            } else {
+                /* Provide noise/empty burst */
+                uint16_t *burst_r = &r_page[0x19];
+                for (int i = 0; i < GSM_BURST_BITS; i++) {
+                    burst_r[i] = 128;  /* erasure */
+                }
+                r_page[0] = 0;
+                r_page[1] = 0;
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
 
     /* ---- Handle TX (uplink) burst ---- */
-    if (task_u != 0) {
-        /*
-         * TX burst data is in the write page.
-         * Offset depends on DSP firmware version.
-         * Typical: starts at word offset 0x19 (byte 0x32) in page.
-         * Each burst = 78 words = 156 bytes (148 useful bits).
-         */
+    if (task_u != 0 && s->sync_state == SYNC_LOCKED) {
         uint16_t *burst_w = &w_page[0x19];
         uint8_t bits[GSM_BURST_BITS];
 
         for (int i = 0; i < GSM_BURST_BITS && i < GSM_BURST_WORDS * 2; i++) {
-            /* Each word holds one bit (bit 0) in standard API format */
             if (i < 78) {
                 bits[i] = burst_w[i] & 1;
             } else {
@@ -325,55 +686,27 @@ static void calypso_dsp_process(CalypsoTRX *s)
             }
         }
 
-        trx_send_burst(s, 0 /* TN from TPU scenario */, s->fn, bits,
-                        GSM_BURST_BITS);
+        trx_send_burst(s, 0, s->fn, bits, GSM_BURST_BITS);
 
+#if TRX_DEBUG_TDMA
         TRX_LOG("TX burst FN=%u task_u=0x%04x", s->fn, task_u);
-    }
-
-    /* ---- Handle RX (downlink) burst injection ---- */
-    if (task_d != 0 && s->rx_pending) {
-        /*
-         * Inject RX burst into read page.
-         * Write soft-bit decisions: 0xFF = strong '1', 0x00 = strong '0'
-         * DSP format: one 16-bit word per soft-bit.
-         */
-        uint16_t *burst_r = &r_page[0x19];
-
-        for (int i = 0; i < GSM_BURST_BITS; i++) {
-            /* Convert soft-bits (0-255) to DSP format */
-            burst_r[i] = s->rx_burst[i];
-        }
-
-        /* Set result flags in read page */
-        r_page[0] = 1;    /* d_bursttype: normal burst */
-        r_page[1] = 0;    /* d_result: OK */
-
-        s->rx_pending = false;
-    } else if (task_d != 0) {
-        /* No RX data available — provide empty/noise burst */
-        uint16_t *burst_r = &r_page[0x19];
-        for (int i = 0; i < GSM_BURST_BITS; i++) {
-            burst_r[i] = 128;  /* Erasure (uncertain bit) */
-        }
-        r_page[0] = 0;  /* No burst */
-        r_page[1] = 0;
+#endif
     }
 
     /* Clear task words (DSP "consumed" them) */
-    w_page[0] = 0;
-    w_page[2] = 0;
+    w_page[DB_W_D_TASK_D] = 0;
+    w_page[DB_W_D_TASK_U] = 0;
 
-    /* Write frame number to NDB for firmware to read */
+    /* Write frame number to NDB */
     ndb[NDB_W_D_FN] = (uint16_t)(s->fn & 0xFFFF);
 }
 
-/* DSP completion timer callback — fires after "DSP processing" delay */
+/* DSP completion timer callback */
 static void calypso_dsp_done(void *opaque)
 {
     CalypsoTRX *s = (CalypsoTRX *)opaque;
 
-    /* Fire DSP API interrupt */
+    /* Fire DSP API interrupt — wakes up firmware to read results */
     qemu_irq_pulse(s->irqs[CALYPSO_IRQ_API]);
 }
 
@@ -397,7 +730,7 @@ static uint64_t calypso_tpu_read(void *opaque, hwaddr offset, unsigned size)
         val = s->tpu_regs[TPU_INT_CTRL / 2];
         break;
     case TPU_INT_STAT:
-        val = 0;  /* No pending TPU interrupts */
+        val = 0;
         break;
     case TPU_DSP_PAGE:
         val = s->dsp_page;
@@ -412,11 +745,11 @@ static uint64_t calypso_tpu_read(void *opaque, hwaddr offset, unsigned size)
         val = s->tpu_regs[TPU_SYNCHRO / 2];
         break;
     default:
-        if (offset >= TPU_RAM_BASE && offset < TPU_RAM_BASE + sizeof(s->tpu_ram)) {
+        if (offset >= TPU_RAM_BASE &&
+            offset < TPU_RAM_BASE + sizeof(s->tpu_ram)) {
             val = s->tpu_ram[(offset - TPU_RAM_BASE) / 2];
-        } else {
-            val = s->tpu_regs[offset / 2 < CALYPSO_TPU_SIZE / 2 ?
-                              offset / 2 : 0];
+        } else if (offset / 2 < CALYPSO_TPU_SIZE / 2) {
+            val = s->tpu_regs[offset / 2];
         }
         break;
     }
@@ -442,7 +775,8 @@ static void calypso_tpu_write(void *opaque, hwaddr offset,
     }
 
     /* TPU instruction RAM */
-    if (offset >= TPU_RAM_BASE && offset < TPU_RAM_BASE + sizeof(s->tpu_ram)) {
+    if (offset >= TPU_RAM_BASE &&
+        offset < TPU_RAM_BASE + sizeof(s->tpu_ram)) {
         s->tpu_ram[(offset - TPU_RAM_BASE) / 2] = (uint16_t)value;
         return;
     }
@@ -453,7 +787,7 @@ static void calypso_tpu_write(void *opaque, hwaddr offset,
             /* TPU enabled — firmware triggered DSP processing */
             s->tpu_enabled = true;
 
-            /* Process DSP tasks immediately */
+            /* Process DSP tasks (sync detection + burst handling) */
             calypso_dsp_process(s);
 
             /* Schedule DSP completion IRQ after small delay (10 µs) */
@@ -467,11 +801,9 @@ static void calypso_tpu_write(void *opaque, hwaddr offset,
 
     case TPU_OFFSET:
     case TPU_SYNCHRO:
-        /* Stored above, no special action */
         break;
 
     case TPU_INT_CTRL:
-        /* Interrupt control — stored above */
         break;
 
     case TPU_DSP_PAGE:
@@ -499,7 +831,7 @@ static uint64_t calypso_tsp_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case TSP_RX_REG:
-        val = 0xFFFF;  /* RX data ready (fake) */
+        val = 0xFFFF;
         break;
     case TSP_CTRL1:
         val = s->tsp_regs[TSP_CTRL1 / 2];
@@ -550,16 +882,14 @@ static uint64_t calypso_ulpd_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case ULPD_SETUP_CLK13:
-        val = 0x2003;  /* CLK13 setup: enabled, stable */
+        val = 0x2003;  /* CLK13: enabled, stable */
         break;
     case ULPD_SETUP_SLICER:
-        val = 0;
-        break;
     case ULPD_SETUP_VTCXO:
         val = 0;
         break;
     case ULPD_COUNTER_HI:
-        s->ulpd_counter += 100;  /* Simulate counter advancing */
+        s->ulpd_counter += 100;
         val = (s->ulpd_counter >> 16) & 0xFFFF;
         break;
     case ULPD_COUNTER_LO:
@@ -596,12 +926,6 @@ static void calypso_ulpd_write(void *opaque, hwaddr offset,
     if (offset / 2 < CALYPSO_ULPD_SIZE / 2) {
         s->ulpd_regs[offset / 2] = (uint16_t)value;
     }
-
-    switch (offset) {
-    case ULPD_GAUGING_CTRL:
-        /* Firmware starts gauging — we complete instantly */
-        break;
-    }
 }
 
 static const MemoryRegionOps calypso_ulpd_ops = {
@@ -627,9 +951,14 @@ static void calypso_tdma_tick(void *opaque)
     s->tpu_enabled = false;
     s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_ENABLE;
 
+    /* Run sync state machine */
+    calypso_sync_tick(s);
+
 #if TRX_DEBUG_TDMA
-    if ((s->fn % 1000) == 0) {
-        TRX_LOG("TDMA FN=%u", s->fn);
+    if ((s->fn % 5000) == 0) {
+        TRX_LOG("TDMA FN=%u sync=%d tasks=%u fb=%u sb=%u",
+                s->fn, s->sync_state, s->sync_task_count,
+                s->sync_fb_tasks, s->sync_sb_tasks);
     }
 #endif
 
@@ -644,10 +973,7 @@ static void calypso_tdma_tick(void *opaque)
 }
 
 /* =====================================================================
- * Public interface: start/stop TDMA
- *
- * The firmware will call these via TPU init or we auto-start.
- * For now, we auto-start when the machine initializes.
+ * Start TDMA and sync
  * ===================================================================== */
 
 static void calypso_tdma_start(CalypsoTRX *s)
@@ -662,8 +988,6 @@ static void calypso_tdma_start(CalypsoTRX *s)
 
 /* =====================================================================
  * DSP API RAM initialization
- *
- * Pre-fill API RAM with values the firmware expects on boot.
  * ===================================================================== */
 
 static void calypso_dsp_api_init(CalypsoTRX *s)
@@ -671,23 +995,57 @@ static void calypso_dsp_api_init(CalypsoTRX *s)
     memset(s->dsp_ram, 0, sizeof(s->dsp_ram));
 
     /*
-     * The DSP ROM normally boots and writes these values.
-     * We fake them so the firmware doesn't hang waiting for DSP boot.
-     *
-     * Key locations in API RAM (byte offsets from base):
-     *   0x0000: Should contain DSP ID after boot
-     *   NDB area: various control words
+     * DSP boot status — firmware polls word 0 of API RAM.
+     * Start at BOOT (0x0001); we'll transition to READY
+     * when the firmware has polled enough times (see dsp_read).
      */
+    s->dsp_ram[DSP_DL_STATUS_ADDR / 2] = DSP_DL_STATUS_BOOT;
+    s->dsp_ram[DSP_API_VER_ADDR / 2]   = 0x0000;
+    s->dsp_ram[DSP_API_VER2_ADDR / 2]  = 0x0000;
 
-    /* DSP alive marker — firmware checks this during dsp_init() */
-    s->dsp_ram[0] = 0x0001;
-
-    /* NDB area: set d_dsp_page to 0 */
+    /* NDB: page=0, no tasks, FN=0 */
     s->dsp_page = 0;
     s->dsp_ram[DSP_API_NDB / 2 + NDB_W_D_DSP_PAGE] = 0;
+    s->dsp_ram[DSP_API_NDB / 2 + NDB_W_D_FN]       = 0;
+
+    /* d_fb_det = 0 (no FB detected yet) */
+    s->dsp_ram[DSP_API_NDB / 2 + NDB_W_D_FB_DET]   = 0;
 
     TRX_LOG("DSP API RAM initialized (%d KiB at 0x%08x)",
             CALYPSO_DSP_SIZE / 1024, CALYPSO_DSP_BASE);
+    TRX_LOG("  Boot status: 0x%04x at byte offset 0x%04x",
+            s->dsp_ram[0], DSP_DL_STATUS_ADDR);
+}
+
+/* =====================================================================
+ * Sync state initialization
+ * ===================================================================== */
+
+static void calypso_sync_init(CalypsoTRX *s)
+{
+    s->sync_state       = SYNC_IDLE;
+    s->sync_fb_countdown = 0;
+    s->sync_sb_countdown = 0;
+    s->sync_arfcn       = SYNC_DEFAULT_ARFCN;
+    s->sync_bsic        = SYNC_DEFAULT_BSIC;
+    s->sync_rssi        = SYNC_DEFAULT_RSSI;
+    s->sync_ref_fn      = 0;
+    s->sync_task_count  = 0;
+    s->sync_fb_tasks    = 0;
+    s->sync_sb_tasks    = 0;
+    s->sync_dsp_booted  = false;
+    s->sync_boot_frame  = 0;
+
+    TRX_LOG("Sync init: ARFCN=%d BSIC=0x%02x(%d,%d) RSSI=%d dBm",
+            s->sync_arfcn, s->sync_bsic,
+            (s->sync_bsic >> 3) & 7, s->sync_bsic & 7,
+            s->sync_rssi);
+    TRX_LOG("  FB detect delay: %d frames", SYNC_FB_DETECT_DELAY);
+    TRX_LOG("  SB decode delay: %d frames", SYNC_SB_DECODE_DELAY);
+    TRX_LOG("  NDB offsets: d_fb_det=w%d a_cd=w%d-%d a_sch26=w%d-%d",
+            NDB_W_D_FB_DET,
+            NDB_W_A_CD_TOA, NDB_W_A_CD_SNR,
+            NDB_W_A_SCH26, NDB_W_A_SCH26 + NDB_W_A_SCH26_LEN - 1);
 }
 
 /* =====================================================================
@@ -701,13 +1059,16 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
     s->irqs = irqs;
     s->trx_fd = -1;
 
-    TRX_LOG("=== Calypso TRX bridge init ===");
+    TRX_LOG("=== Calypso TRX bridge init (with ARFCN sync) ===");
 
     /* ---- DSP API RAM ---- */
     memory_region_init_io(&s->dsp_iomem, NULL, &calypso_dsp_ops, s,
                           "calypso.dsp_api", CALYPSO_DSP_SIZE);
     memory_region_add_subregion(sysmem, CALYPSO_DSP_BASE, &s->dsp_iomem);
     calypso_dsp_api_init(s);
+
+    /* ---- Sync state ---- */
+    calypso_sync_init(s);
 
     /* ---- TPU ---- */
     memory_region_init_io(&s->tpu_iomem, NULL, &calypso_tpu_ops, s,
@@ -734,7 +1095,7 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
     if (trx_port > 0) {
         trx_socket_init(s, trx_port);
     } else {
-        TRX_LOG("TRX UDP disabled (use -M calypso-high,trx-port=4729 to enable)");
+        TRX_LOG("TRX UDP disabled");
     }
 
     /* ---- Auto-start TDMA ---- */
@@ -746,8 +1107,9 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
     TRX_LOG("  TPU:      0x%08x", CALYPSO_TPU_BASE);
     TRX_LOG("  TSP:      0x%08x", CALYPSO_TSP_BASE);
     TRX_LOG("  ULPD:     0x%08x", CALYPSO_ULPD_BASE);
-    TRX_LOG("  TDMA:     4.615ms frame timer → IRQ %d", CALYPSO_IRQ_TPU_FRAME);
+    TRX_LOG("  TDMA:     4.615ms → IRQ %d", CALYPSO_IRQ_TPU_FRAME);
     TRX_LOG("  DSP done: → IRQ %d", CALYPSO_IRQ_API);
+    TRX_LOG("  Sync:     ARFCN=%d BSIC=%d", s->sync_arfcn, s->sync_bsic);
     if (s->trx_fd >= 0) {
         TRX_LOG("  TRX UDP:  port %d", trx_port);
     }
