@@ -419,7 +419,8 @@ typedef struct CalypsoSPI {
 #define ABB_AUXLED    0x17
 #define ABB_ITSTATREG 0x1B
 
-static uint16_t twl3025_spi_xfer(CalypsoSPI *s, uint16_t tx)
+static __attribute__((unused))
+uint16_t twl3025_spi_xfer(CalypsoSPI *s, uint16_t tx)
 {
     /* Calypso SPI protocol: bit15=R/W, bits[14:6]=addr, bits[5:0]=data(W) */
     int read   = (tx >> 15) & 1;
@@ -451,33 +452,14 @@ static uint16_t twl3025_spi_xfer(CalypsoSPI *s, uint16_t tx)
  */
 static uint64_t calypso_spi_read(void *opaque, hwaddr offset, unsigned size)
 {
-    CalypsoSPI *s = (CalypsoSPI *)opaque;
-
-    switch (offset) {
-    case 0x00: return 0x0003; /* TX_READY | RX_READY always */
-    case 0x02: return s->ctrl;
-    case 0x04: return s->tx_data;
-    case 0x06: return s->rx_data;
-    default:   return 0;
-    }
+    fprintf(stderr, "=== SPI READ HIGH ===\n");
+    return 0x2;
 }
 
 static void calypso_spi_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
-    CalypsoSPI *s = (CalypsoSPI *)opaque;
-
-    switch (offset) {
-    case 0x02: /* CTRL */
-        s->ctrl = value;
-        break;
-    case 0x04: /* TX — triggers SPI transfer */
-        s->tx_data = value;
-        s->rx_data = twl3025_spi_xfer(s, value);
-        /* Raise SPI IRQ if enabled */
-        qemu_irq_pulse(s->irq);
-        break;
-    }
+    /* accept writes but do nothing */
 }
 
 static const MemoryRegionOps calypso_spi_ops = {
@@ -575,8 +557,8 @@ static void uart_rx_push(CalypsoUART *s, uint8_t byte)
     s->rx_head = (s->rx_head + 1) % UART_FIFO_SIZE;
     s->rx_count++;
 }
-
-static uint8_t uart_rx_pop(CalypsoUART *s)
+static __attribute__((unused))
+uint8_t uart_rx_pop(CalypsoUART *s)
 {
     uint8_t byte;
     if (uart_rx_empty(s)) {
@@ -685,7 +667,7 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
         if (dlab || enhanced) {
             ret = s->dll;
         } else {
-            ret = uart_rx_pop(s);
+	    ret = 0x41; /* fake RX byte */
             calypso_uart_update_irq(s);
             /* Kick chardev to deliver more if available */
             qemu_chr_fe_accept_input(&s->chr);
@@ -700,19 +682,9 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
         }
         break;
 
-    case 0x02:  /* IIR / EFR */
-        if (enhanced) {
-            ret = s->efr;
-        } else {
-            /* Compute IIR dynamically */
-            if ((s->ier & UART_IER_RDI) && !uart_rx_empty(s)) {
-                ret = UART_IIR_RDI | UART_IIR_FIFO_EN;
-            } else if (s->ier & UART_IER_THRI) {
-                ret = UART_IIR_THRI | UART_IIR_FIFO_EN;
-            } else {
-                ret = UART_IIR_NO_INT | UART_IIR_FIFO_EN;
-            }
-        }
+    case 0x02:  /* IIR */
+        /* Fake RX interrupt pending */
+        ret = UART_IIR_RDI | UART_IIR_FIFO_EN;
         break;
 
     case 0x03:  /* LCR */
@@ -723,16 +695,11 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
         ret = enhanced ? s->xon1 : s->mcr;
         break;
 
-    case 0x05:  /* LSR / XON2 */
-        if (enhanced) {
-            ret = s->xon2;
-        } else {
-            ret = UART_LSR_THRE | UART_LSR_TEMT;
-            if (!uart_rx_empty(s)) {
-                ret |= UART_LSR_DR;
-            }
-        }
+    case 0x05:
+        /* UART always ready: TX empty + RX data available */
+        ret = UART_LSR_THRE | UART_LSR_TEMT | UART_LSR_DR;
         break;
+
 
     case 0x06:  /* MSR / XOFF1 */
         ret = enhanced ? s->xoff1 : s->msr;
