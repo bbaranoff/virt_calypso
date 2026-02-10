@@ -932,8 +932,8 @@ static const MemoryRegionOps calypso_ulpd_ops = {
     .read = calypso_ulpd_read,
     .write = calypso_ulpd_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 2, .max_access_size = 2 },
-    .impl  = { .min_access_size = 2, .max_access_size = 2 },
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+    .impl  = { .min_access_size = 1, .max_access_size = 2 },
 };
 
 /* =====================================================================

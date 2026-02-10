@@ -359,44 +359,13 @@ typedef struct CalypsoKeypad {
  */
 static uint64_t calypso_keypad_read(void *opaque, hwaddr offset, unsigned size)
 {
-    CalypsoKeypad *k = (CalypsoKeypad *)opaque;
-
-    switch (offset) {
-    case 0x00: return k->ctrl;
-    case 0x02: return k->debounce;
-    case 0x04: return k->column_out;
-    case 0x06: return k->row_in;
-    case 0x08: return k->isr;
-    case 0x0A: return k->irq_enabled ? 0xFFFF : 0x0000;
-    default:   return 0xFFFF;
-    }
+    return 0x0000;
 }
 
 static void calypso_keypad_write(void *opaque, hwaddr offset, uint64_t value,
                                  unsigned size)
 {
-    CalypsoKeypad *k = (CalypsoKeypad *)opaque;
-
-    switch (offset) {
-    case 0x00:
-        k->ctrl = value;
-        break;
-    case 0x02:
-        k->debounce = value;
-        break;
-    case 0x04:
-        k->column_out = value;
-        break;
-    case 0x08: /* ISR: write 1 to clear */
-        k->isr &= ~value;
-        if (k->isr == 0) {
-            qemu_irq_lower(k->irq);
-        }
-        break;
-    case 0x0A: /* IMR */
-        k->irq_enabled = (value != 0);
-        break;
-    }
+    /* ignore all writes: keypad disabled */
 }
 
 static const MemoryRegionOps calypso_keypad_ops = {
