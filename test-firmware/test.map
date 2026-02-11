@@ -1,0 +1,120 @@
+
+Discarded input sections
+
+ .comment       0x00000000       0x27 test-firmware.o
+
+Memory Configuration
+
+Name             Origin             Length             Attributes
+RAM              0x00800000         0x00040000         xrw
+FLASH            0x02000000         0x00400000         xr
+*default*        0x00000000         0xffffffff
+
+Linker script and memory map
+
+LOAD test-firmware.o
+                0x00840000                        __stack_top = (ORIGIN (RAM) + LENGTH (RAM))
+
+.vectors        0x00800000       0x38
+ *(.vectors)
+ .vectors       0x00800000       0x38 test-firmware.o
+                0x00800000                vectors
+
+.text           0x00800038      0x3c8
+ *(.text*)
+ .text          0x00800038       0x8c test-firmware.o
+                0x00800038                reset_handler
+                0x00800044                uart_putc
+                0x00800050                uart_puts
+                0x00800074                timer_read
+                0x00800084                delay
+ .text.startup  0x008000c4      0x278 test-firmware.o
+                0x008000c4                main
+ *(.rodata*)
+ .rodata.str1.4
+                0x0080033c       0xc2 test-firmware.o
+                0x00800400                        . = ALIGN (0x4)
+ *fill*         0x008003fe        0x2 
+
+.glue_7         0x00800400        0x0
+ .glue_7        0x00800400        0x0 linker stubs
+
+.glue_7t        0x00800400        0x0
+ .glue_7t       0x00800400        0x0 linker stubs
+
+.vfp11_veneer   0x00800400        0x0
+ .vfp11_veneer  0x00800400        0x0 linker stubs
+
+.v4_bx          0x00800400        0x0
+ .v4_bx         0x00800400        0x0 linker stubs
+
+.iplt           0x00800400        0x0
+ .iplt          0x00800400        0x0 test-firmware.o
+
+.rel.dyn        0x00800400        0x0
+ .rel.iplt      0x00800400        0x0 test-firmware.o
+
+.data           0x00800400        0x0
+ *(.data*)
+ .data          0x00800400        0x0 test-firmware.o
+                0x00800400                        . = ALIGN (0x4)
+
+.igot.plt       0x00800400        0x0
+ .igot.plt      0x00800400        0x0 test-firmware.o
+
+.bss            0x00800400        0x0
+                0x00800400                        __bss_start = .
+ *(.bss*)
+ .bss           0x00800400        0x0 test-firmware.o
+ *(COMMON)
+                0x00800400                        . = ALIGN (0x4)
+                0x00800400                        __bss_end = .
+
+.debug_info     0x00000000      0x56a
+ *(.debug_info)
+ .debug_info    0x00000000      0x56a test-firmware.o
+
+.debug_abbrev   0x00000000      0x206
+ *(.debug_abbrev)
+ .debug_abbrev  0x00000000      0x206 test-firmware.o
+
+.debug_line     0x00000000      0x3a8
+ *(.debug_line)
+ .debug_line    0x00000000      0x3a8 test-firmware.o
+
+.debug_str      0x00000000      0x116
+ *(.debug_str)
+ .debug_str     0x00000000      0x116 test-firmware.o
+                                0x123 (size before relaxing)
+
+.debug_ranges
+ *(.debug_ranges)
+
+/DISCARD/
+ *(.ARM.exidx*)
+ *(.ARM.extab*)
+ *(.comment)
+OUTPUT(test.elf elf32-littlearm)
+LOAD linker stubs
+
+.ARM.attributes
+                0x00000000       0x2b
+ .ARM.attributes
+                0x00000000       0x2b test-firmware.o
+
+.debug_loclists
+                0x00000000      0x2e3
+ .debug_loclists
+                0x00000000      0x2e3 test-firmware.o
+
+.debug_aranges  0x00000000       0x28
+ .debug_aranges
+                0x00000000       0x28 test-firmware.o
+
+.debug_rnglists
+                0x00000000      0x192
+ .debug_rnglists
+                0x00000000      0x192 test-firmware.o
+
+.debug_frame    0x00000000       0x80
+ .debug_frame   0x00000000       0x80 test-firmware.o

@@ -2,14 +2,14 @@
  * Linker script pour firmware Calypso
  * 
  * Carte mémoire:
- *   RAM:   0x00800000 - 0x0081FFFF (128 KiB)
+ *   RAM:   0x00800000 - 0x0083FFFF (256 KiB)
  *   Flash: 0x02000000 - 0x023FFFFF (4 MiB)
  */
 
 MEMORY
 {
     /* RAM principale */
-    RAM (rwx) : ORIGIN = 0x00800000, LENGTH = 128K
+    RAM (rwx) : ORIGIN = 0x00800000, LENGTH = 256K
     
     /* Flash (optionnel) */
     FLASH (rx) : ORIGIN = 0x02000000, LENGTH = 4M

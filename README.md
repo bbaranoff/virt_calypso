@@ -1,7 +1,7 @@
 # Calypso SoC QEMU Machine — Install Package
 
 Émulation du SoC TI Calypso (ARM946E-S) pour QEMU 9.2.
-Deux machines : `calypso-min` (stubs) et `calypso-high` (INTH, timers, keypad, ABB).
+Deux machines : `calypso-min` (stubs) et `calypso-high` (INTH, timers, keypad, ABB, TRX bridge).
 
 ## Installation rapide
 
@@ -32,35 +32,50 @@ Vérifier :
 ```
 calypso-pkg/
 ├── hw/arm/calypso/
-│   ├── calypso.c           # Machine calypso-min (stubs)
-│   ├── calypso_high.c      # Machine calypso-high (INTH, timers, keypad, ABB)
-│   ├── meson.build         # Build config
-│   └── Kconfig             # Kernel config
+│   ├── calypso.c            # Machine calypso-min (stubs)
+│   ├── calypso_high.c       # Machine calypso-high (QOM instantiation)
+│   ├── calypso_trx.c        # DSP/TPU/TRX bridge — virtual GSM PHY
+│   ├── calypso_trx.h        # Header (IRQ map, DSP API, constantes)
+│   ├── calypso_inth.{c,h}   # QOM: Interrupt controller (SysBusDevice)
+│   ├── calypso_timer.{c,h}  # QOM: GP/Watchdog timer (SysBusDevice)
+│   ├── calypso_uart.{c,h}   # QOM: UART + 64B FIFO (SysBusDevice)
+│   ├── calypso_spi.{c,h}    # QOM: SPI + TWL3025 ABB (SysBusDevice)
+│   ├── meson.build           # Build config
+│   └── Kconfig               # Kernel config
 ├── test-firmware/
-│   ├── test-firmware.c     # Firmware de test
-│   ├── linker.ld           # Linker script
-│   └── Makefile            # Build firmware
+│   ├── test-firmware.c       # Firmware de test bare-metal
+│   ├── linker.ld             # Linker script (RAM @ 0x00800000)
+│   └── Makefile              # Build firmware (arm-none-eabi-gcc)
+├── tools/
+│   ├── trx.py                # TRX Bridge — pont osmo-bts-trx <-> QEMU
+│   └── trx_test.py           # Outil de test loopback TRX UDP
 ├── docs/
-│   ├── REGISTERS.md        # Référence des registres
-│   ├── MIGRATION.md        # Guide migration QEMU 9.2
-│   └── PATCH-INFO.txt      # Info patch
-├── install.sh              # Installation automatique
-├── uninstall.sh            # Désinstallation
-└── README.md               # Ce fichier
+│   ├── REGISTERS.md           # Référence des registres périphériques
+│   ├── README-TRX.md          # Documentation TRX bridge + architecture
+│   ├── MIGRATION.md           # Guide migration QEMU 9.2
+│   └── PATCH-INFO.txt         # Info patch pour upstream
+├── install.sh                # Installation automatique
+├── uninstall.sh              # Désinstallation
+└── README.md                 # Ce fichier
 ```
 
 ## Machines disponibles
 
-| Feature          | calypso-min | calypso-high |
-|------------------|-------------|--------------|
-| Internal RAM     | 256K        | 256K         |
-| External RAM     | —           | 8 MiB        |
-| INTH (IRQ ctrl)  | —           | ✓ 32 IRQs   |
-| Timer 1 w/ IRQ   | stub        | ✓ real ticks |
-| Timer 2 w/ IRQ   | —           | ✓ real ticks |
-| Keypad w/ IRQ    | —           | ✓ press/release |
-| SPI + TWL3025    | stub        | ✓ register R/W |
-| Flash            | 4 MiB       | 4 MiB        |
+| Feature          | calypso-min  | calypso-high  |
+|------------------|--------------|---------------|
+| Internal RAM     | 256K         | 256K          |
+| External RAM     | —            | 8 MiB         |
+| INTH (IRQ ctrl)  | —            | ✓ 32 IRQs     |
+| Timer 1 w/ IRQ   | stub         | ✓ real ticks  |
+| Timer 2 w/ IRQ   | —            | ✓ real ticks  |
+| Keypad w/ IRQ    | —            | ✓ press/release|
+| SPI + TWL3025    | stub         | ✓ register R/W|
+| UART (×2)        | stub         | ✓ FIFO + IRQ  |
+| DSP API RAM      | —            | ✓ 64 KiB      |
+| TPU / TSP / ULPD | —            | ✓ stubs       |
+| TRX UDP bridge   | —            | ✓ port 4729   |
+| FCCH/SCH sync    | —            | ✓ simulation  |
+| Flash            | 4 MiB        | 4 MiB         |
 
 ## Utilisation
 
@@ -97,6 +112,21 @@ osmocon -p /tmp/serial1 -m c123xor layer1.highram.bin
 (qemu) c
 ```
 
+### TRX Bridge (pont vers osmo-bts-trx)
+
+```bash
+# Terminal dédié
+python3 tools/trx.py
+```
+
+Voir `docs/README-TRX.md` pour la documentation complète de l'architecture TRX.
+
+### Test loopback TRX (sans BTS)
+
+```bash
+python3 tools/trx_test.py --loopback
+```
+
 ### Debug GDB
 
 ```bash
@@ -112,6 +142,15 @@ arm-none-eabi-gdb firmware.elf
 set *(unsigned short *)0xFFFE4806 = 0x0001
 set *(unsigned short *)0xFFFE4808 = 0x0001
 c
+```
+
+### Compiler le firmware de test
+
+```bash
+cd test-firmware
+make
+make test    # lancer avec QEMU
+make debug   # lancer avec GDB
 ```
 
 ## Désinstallation
@@ -135,3 +174,15 @@ par `-machine`. On utilise `MACHINE_TYPE_NAME()` qui fait ça automatiquement.
 `install.sh` corrige ça.
 
 **`unknown type uint64_t` :** `qemu/osdep.h` doit être le PREMIER include dans chaque .c.
+
+**DSP API version check fails :** Le firmware lit `DSP_DL_STATUS` à 0xFFD00000.
+`calypso_trx.c` initialise la RAM DSP avec `status=0x0002` et `version=0x3606`.
+
+## Documentation complémentaire
+
+| Document              | Description                                      |
+|-----------------------|--------------------------------------------------|
+| `docs/README-TRX.md`  | Architecture TRX, data flow, packet format       |
+| `docs/REGISTERS.md`   | Référence registres (memory map, UART, SPI, etc) |
+| `docs/MIGRATION.md`   | Migration depuis anciennes versions QEMU         |
+| `docs/PATCH-INFO.txt` | Informations patch pour soumission upstream       |

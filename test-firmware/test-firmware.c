@@ -92,12 +92,12 @@ void main(void) {
     
     /* Boucle infinie finale */
     while (1) {
-        __asm__ volatile ("wfi"); /* Wait For Interrupt */
+        __asm__ volatile ("nop");
     }
 }
 
 /* Vecteurs d'interruption */
-void __attribute__((naked, section(".vectors"))) reset_handler(void) {
+void __attribute__((naked)) reset_handler(void) {
     __asm__ volatile (
         "ldr sp, =__stack_top\n"
         "bl main\n"
@@ -105,19 +105,14 @@ void __attribute__((naked, section(".vectors"))) reset_handler(void) {
     );
 }
 
-/* Table des vecteurs - doit être en début de mémoire */
+
+extern void reset_handler(void);
+
 const void *vectors[] __attribute__((section(".vectors"))) = {
-    (void *)0x00820000,  /* Initial Stack Pointer (fin de la RAM) */
-    reset_handler,       /* Reset */
-    0,                   /* NMI */
-    0,                   /* Hard Fault */
-    0,                   /* Memory Management */
-    0,                   /* Bus Fault */
-    0,                   /* Usage Fault */
-    0, 0, 0, 0,         /* Reserved */
-    0,                   /* SVCall */
-    0, 0,               /* Reserved */
-    0,                   /* PendSV */
-    0,                   /* SysTick */
-    /* IRQ handlers */
+    (void *)0x00820000,
+    reset_handler,
+    0,0,0,0,0,
+    0,0,0,0,
+    0,0,
+    0,
 };
