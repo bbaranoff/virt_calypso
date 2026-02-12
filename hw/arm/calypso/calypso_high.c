@@ -337,10 +337,10 @@ static void calypso_high_init(MachineState *machine)
     calypso_create_mmio(sysmem, "calypso.mmio_ffxx",
                         CALYPSO_MMIO_FFXX, &calypso_mmio8_ops, NULL,
                         CALYPSO_PERIPH_SIZE);
-
+    
     /* ---- TRX bridge ---- */
     {
-        qemu_irq irqs[CALYPSO_NUM_IRQS];
+        qemu_irq *irqs = g_new0(qemu_irq, CALYPSO_NUM_IRQS);
         for (int i = 0; i < CALYPSO_NUM_IRQS; i++) {
             irqs[i] = INTH_IRQ(i);
         }
