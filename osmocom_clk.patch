@@ -1,0 +1,54 @@
+--- a/src/host/layer23/src/transceiver/trx.h
++++ b/src/host/layer23/src/transceiver/trx.h
+@@ -2,6 +2,7 @@
+ 
+ #include <osmocom/core/select.h>
+ #include <osmocom/core/linuxlist.h>
++#include <osmocom/core/timer.h>
+ 
+ struct app_state;
+ 
+@@ -55,4 +56,7 @@
+ 	int gain;
+ 	uint8_t type[8];
+ 	uint8_t handover[8];
++
++	struct osmo_timer_list clk_timer;
++	uint32_t clk_fn;
+ };
+
+--- a/src/host/layer23/src/transceiver/trx.c
++++ b/src/host/layer23/src/transceiver/trx.c
+@@ -114,6 +114,16 @@
+ 	return rv;
+ }
+ 
++/* Callback simulant l'horloge TDMA GSM (4.615ms par frame) */
++static void trx_clk_timer_cb(void *data)
++{
++	struct trx *trx = data;
++
++	trx_clk_ind(trx, trx->clk_fn++);
++
++	/* Reschedule pour la frame suivante */
++	osmo_timer_schedule(&trx->clk_timer, 0, 4615);
++}
++
+ struct trx *
+ trx_alloc(const char *addr, uint16_t base_port, struct app_state *as, int clock)
+ {
+@@ -160,6 +170,13 @@
+ 	if (rv)
+ 		goto err;
+ 
++	/* Initialisation de l'horloge logicielle interne */
++	trx->clk_fn = 0;
++	trx->clk_timer.cb = trx_clk_timer_cb;
++	trx->clk_timer.data = trx;
++
++	/* Lancement du cycle d'horloge */
++	osmo_timer_schedule(&trx->clk_timer, 0, 4615);
++
+ 	return trx;
+ 
+ err:
