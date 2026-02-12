@@ -6,7 +6,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 QEMU=~/qemu/build/qemu-system-arm
 OSMO_FW="$SCRIPT_DIR/compal_e88"
 OSMOCON=~/osmocom-bb/src/host/osmocon/osmocon
-TRX_TEST=~/calypso-pkg/tools/trx_test.py
+TRX_TEST=~/virt_calypso/tools/trx_test.py
 
 UART_SYMLINK=/tmp/calypso_uart
 PTY_LINK=/tmp/calypso_serial
